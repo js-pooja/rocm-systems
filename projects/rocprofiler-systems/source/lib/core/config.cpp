@@ -59,6 +59,7 @@
 #include <fstream>
 #include <limits>
 #include <linux/capability.h>
+#include <memory>
 #include <numeric>
 #include <ostream>
 #include <sstream>
@@ -76,8 +77,20 @@ using settings = tim::settings;
 
 namespace
 {
-int  verbose_value  = rocprofsys::get_env<int>(env_vars::VERBOSE, 0);
-bool debug_value    = rocprofsys::get_env<bool>(env_vars::DEBUG_MODE, false);
+int&
+verbose_value()
+{
+    static int value = rocprofsys::get_env<int>(env_vars::VERBOSE, 0);
+    return value;
+}
+
+bool&
+debug_value()
+{
+    static bool value = rocprofsys::get_env<bool>(env_vars::DEBUG_MODE, false);
+    return value;
+}
+
 auto configure_once = std::once_flag{};
 
 TIMEMORY_NOINLINE bool&
@@ -1589,9 +1602,9 @@ configure_settings(bool _init)
     settings::suppress_config() = true;
 
     if(auto opt = get_setting_value<int>(std::string{ env_vars::VERBOSE }); opt)
-        verbose_value = *opt;
+        verbose_value() = *opt;
     if(auto opt = get_setting_value<bool>(std::string{ env_vars::DEBUG_MODE }); opt)
-        debug_value = *opt;
+        debug_value() = *opt;
 
     if(get_env(env_vars::MONOCHROME,
                _config->get<bool>(std::string{ env_vars::MONOCHROME })))
@@ -1678,9 +1691,9 @@ configure_settings(bool _init)
     LOG_DEBUG("Configuration complete");
 
     if(auto opt = get_setting_value<int>(std::string{ env_vars::VERBOSE }); opt)
-        verbose_value = *opt;
+        verbose_value() = *opt;
     if(auto opt = get_setting_value<bool>(std::string{ env_vars::DEBUG_MODE }); opt)
-        debug_value = *opt;
+        debug_value() = *opt;
 
     _settings_are_configured() = true;
 }
@@ -2207,7 +2220,7 @@ print_settings(
         return lhs.at(0) < rhs.at(0);
     });
 
-    auto tot_width = std::accumulate(_widths.begin(), _widths.end(), 0);
+    auto tot_width = std::accumulate(_widths.begin(), _widths.end(), std::size_t{ 0 });
     if(!_print_desc) tot_width -= _widths.back() + 4;
 
     size_t _spacer_extra = 9;
@@ -2226,9 +2239,10 @@ print_settings(
         {
             switch(i)
             {
-                case 0: _os << std::left; break;
-                case 1: _os << std::left; break;
+                case 0:
+                case 1:
                 case 2: _os << std::left; break;
+                default: break;
             }
             if(_md)
             {
@@ -2248,6 +2262,7 @@ print_settings(
                     case 0: _os << "= "; break;
                     case 1: _os << "[ "; break;
                     case 2: _os << "]"; break;
+                    default: break;
                 }
             }
         }
@@ -2292,7 +2307,7 @@ print_settings(bool _include_env)
         tim::print_env(_ss1, [_is_rocprofsys_option](const std::string& _v) {
             auto _is_omni_opt = _is_rocprofsys_option(_v, std::set<std::string>{});
             if(settings::verbose() >= 2 || settings::debug()) return _is_omni_opt;
-            return (_is_omni_opt && _v.find("ROCPROFSYS_SIGNAL_") != 0);
+            return (_is_omni_opt && !_v.starts_with("ROCPROFSYS_SIGNAL_"));
         });
 
         LOG_INFO("{}", _ss1.str());
@@ -2397,7 +2412,7 @@ bool
 get_debug()
 {
     std::call_once(configure_once, []() { (void) get_config(); });
-    return debug_value;
+    return debug_value();
 }
 
 bool
@@ -2420,7 +2435,7 @@ int
 get_verbose()
 {
     std::call_once(configure_once, []() { (void) get_config(); });
-    return verbose_value;
+    return verbose_value();
 }
 
 bool&
@@ -3243,12 +3258,11 @@ get_ump_absolute_path()
         const auto* pwd = getenv("PWD");
         if(pwd != nullptr && pwd[0] != '\0') return std::string{ pwd };
 
-        char* current_dir = getcwd(nullptr, 0);
+        std::unique_ptr<char, decltype(&std::free)> current_dir(getcwd(nullptr, 0),
+                                                                std::free);
         if(current_dir == nullptr) return std::string{ "." };
 
-        auto result = std::string{ current_dir };
-        free(current_dir);
-        return result;
+        return std::string{ current_dir.get() };
     };
 
     auto make_absolute = [&](std::string path) {
@@ -3747,7 +3761,7 @@ get_causal_mode()
         {
             auto _mode = static_cast<tim::tsettings<std::string>&>(*_v->second).get();
             throw std::runtime_error(
-                fmt::format("[{}] invalid causal mode {}. Choices: {}", __FUNCTION__,
+                fmt::format("[get_causal_mode] invalid causal mode {}. Choices: {}",
                             _mode, fmt::join(_v->second->get_choices(), ", ")));
         }
         return state::process::CausalMode::Function;
