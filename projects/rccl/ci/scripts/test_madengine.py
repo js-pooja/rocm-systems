@@ -10,12 +10,13 @@ This script handles:
   6. Appending results to a JSONL datastore for trend analysis
 
 Usage from GitHub Actions (on ruby-linux-slurm-scale-runner):
-  python projects/rccl/ci/scripts/test_madengine.py \
-      --artifact-dir /apps/cvs_tests/dist_new/dist/rocm \
+  python3 rocm-systems/projects/rccl/ci/scripts/test_madengine.py \
+      --artifact-dir ./build \
       --workload llama-3.1-70b-training \
       --cluster ruby \
       --nodes 2 \
-      --results-dir /apps/rccl-ci/perf
+      --results-dir /apps/rccl-ci/madengine/perf \
+      --work-dir /apps/rccl-ci/madengine/workdir/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}
 """
 from __future__ import annotations
 
@@ -133,7 +134,7 @@ CLUSTER_CONFIGS = {
             "NCCL_SOCKET_IFNAME": "fenic0",
             "NCCL_DEBUG": "WARN",
         },
-        "results_base": "/apps/rccl-ci/perf",
+        "results_base": "/apps/rccl-ci/madengine/perf",
     },
 }
 
