@@ -292,8 +292,6 @@ def test_pc_sampling_analyze_csv_output(
         assert len(csv_pc_sampling) == 19
         assert csv_pc_sampling["count"].sum() == 857
         assert set(csv_pc_sampling["pid"]) == {698961}
-        # The CSV exports the summary view, so it carries the same values the
-        # database test pins.
         assert csv_pc_sampling["active_thread_percent"].eq(100.0).all()
         assert csv_pc_sampling["wave_occupancy_percent"].gt(0).all()
         assert csv_pc_sampling["wave_occupancy_percent"].le(100).all()
