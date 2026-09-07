@@ -22,4 +22,13 @@ to_lower(std::string_view value)
 
     return str_copy;
 }
+
+[[nodiscard]] constexpr bool
+equals_ignore_case(std::string_view lhs, std::string_view rhs) noexcept
+{
+    return std::ranges::equal(lhs, rhs, [](char left, char right) {
+        return std::tolower(left) == std::tolower(right);
+    });
+}
+
 }  // namespace rocprofsys::utility::string
