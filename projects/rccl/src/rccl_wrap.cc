@@ -1289,7 +1289,7 @@ ncclResult_t rcclSelectAllReduce(struct ncclComm* comm, const void* sendbuff, vo
   // (3): symMaxR2 chooses between symk and CE-registered, it does not hand
   // registered operands to DDA.
   const bool ddaFabricArch1250 = IsArchMatch(comm->archName, "gfx1250");
-  const size_t arDdaVmmMax = rcclDdaVmmThreshold(comm, ncclFuncAllReduce);
+  const size_t arDdaVmmMax = rcclDdaVmmThresholdCtx(comm, ncclFuncAllReduce, winRegType, ceCapturing);
   if (rcclAllReduceShouldTakeDdaPath(comm, count, datatype, symkRequested, ceAllReduceAllowed)) {
     if (ddaFabricArch1250) {
       const size_t arDdaLLMax    = rcclDdaLLThreshold(comm, ncclFuncAllReduce);
