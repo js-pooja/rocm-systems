@@ -11,7 +11,7 @@
 #include <unordered_map>
 
 #include <amdgpu.h>
-#include <amdgpu_drm.h>
+#include <hsakmt/drm/amdgpu_drm.h>
 
 #include "core/inc/amd_kfd_driver.h"
 #include "core/inc/runtime.h"
@@ -180,6 +180,11 @@ public:
   /// @param [in] type   The type of queue for the request.
   /// @param[out] info   A non-NULL pointer where the information requested will be stored.
   hsa_status_t GetUserQueueMetadata(core::Agent &agent, queue_type type, struct drm_amdgpu_info_uq_metadata *info);
+
+  /// @brief Query CWSR (compute wave save/restore) sizing for an agent.
+  /// @param[in]  agent  The GPU agent to query.
+  /// @param[out] info   A non-NULL pointer where the CWSR sizing will be stored.
+  hsa_status_t QueryCwsrInfo(core::Agent &agent, struct drm_amdgpu_info_cwsr *info);
 
   /// @brief Map HSA queue priority to hardware queue priority
   ///
