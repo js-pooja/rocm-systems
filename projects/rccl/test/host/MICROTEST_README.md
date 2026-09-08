@@ -49,10 +49,11 @@ export colliding non-`static` symbols; otherwise a unit needs its own binary:
     in `fakes/wrap_fakes.cc`, same as `p2p-test.cc`/`p2p_fakes.cc`. Real
     `archinfo.cc` is compiled alongside it for `IsArchMatch`
     (`rcclIsArchSupportedForFunc` et al. need the real prefix-match
-    behaviour). Covers a low-dependency first batch plus a second batch that
-    added controllable `RCCL_PARAM`/`getenv` seams to reach the CE/DDA gates
-    and low-tier symmetric-kernel arms; see `wrap-test.cc`'s header comment
-    for exact scope.
+    behaviour). Every function is now covered; see `wrap-test.cc`'s header
+    comment for the per-function breakdown. One deliberate, permanent
+    exclusion: the `#ifdef ENABLE_WARP_SPEED` cluster (~10 functions) is
+    compiled out of this binary entirely, so no seam can reach it without
+    changing the binary's own build configuration.
 - **`rccl-UnitTestsMicroEnqueue`** — `enqueue.cc` (via `ENQUEUE_CC_PATH`); suite
   `EnqueueMicrotest.*`. All tests live in `enqueue-test.cc`, grouped by unit under
   test; several fixtures are reused by later groups, so the order within the file

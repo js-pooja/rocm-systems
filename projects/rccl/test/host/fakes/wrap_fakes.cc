@@ -100,7 +100,15 @@ char  ncclLastError[1024] = {};
 int64_t ncclParamMinNchannels() { return -2; }              // graph/connect.cc:832
 int64_t ncclParamMaxNchannels() { return -2; }              // graph/connect.cc:833
 int64_t rcclParamForceCe() { return 1; }                    // enqueue.cc:3785
-int64_t ncclParamLaunchOrderImplicit() { return 0; }        // enqueue.cc:1985
+
+// ncclParamLaunchOrderImplicit: upgraded to a settable hook (unlike the three
+// plain scalars above) so a test can drive rcclDdaEnabled's
+// `ncclParamLaunchOrderImplicit() != 0` disjunct independently -- the real
+// default (0, "explicit launch order") favors the common case, matching the
+// other three.
+static int64_t DefaultParamLaunchOrderImplicit() { return 0; }  // enqueue.cc:1985
+std::function<int64_t()> g_paramLaunchOrderImplicit = DefaultParamLaunchOrderImplicit;
+int64_t ncclParamLaunchOrderImplicit() { return g_paramLaunchOrderImplicit(); }
 
 // The settable env-var fake (SetMicroEnv/SetMicroEnvAbsent/ClearMicroEnv,
 // the bare-getenv() link-level interposer, and ncclGetEnv) is NOT defined
@@ -109,7 +117,6 @@ int64_t ncclParamLaunchOrderImplicit() { return 0; }        // enqueue.cc:1985
 // "Where a fake belongs"). rccl_wrap.cc's several bare getenv() call sites
 // (rcclSetPxn, rcclSetP2pNetChunkSize, rcclUpdateCollectiveProtocol,
 // rcclUpdateThreadThreshold, ...) are covered by that same interposer.
-
 // ncclGroupDepth is NOT faked here: group-test.cc (also part of this binary
 // since the rccl-UnitTestsMicro merge) compiles the real group.cc, which
 // defines it -- a second copy here would be a duplicate-symbol error. Its
@@ -118,20 +125,35 @@ int64_t ncclParamLaunchOrderImplicit() { return 0; }        // enqueue.cc:1985
 
 // rcclUseAinic: real definition (transport/net.cc:343) does hardware NIC
 // detection via std::call_once; not linked here (pulls in the IB/net
-// transport layer). false -- "not an AINIC" -- is the common-case default.
-bool rcclUseAinic() { return false; }
+// transport layer). false -- "not an AINIC" -- is the common-case default,
+// now a controllable seam so rcclUseAllGatherDirect's AINIC-disabled branch
+// (never exercised before) can be proven too.
+static bool DefaultUseAinic() { return false; }
+std::function<bool()> g_useAinic = DefaultUseAinic;
+bool rcclUseAinic() { return g_useAinic(); }
 
 // ncclPxnDisable: real definition graph/paths.cc:740, reads comm fields set
 // up during channel/topology construction this lean binary doesn't build.
 // Not to be confused with rcclSetPxn (already tested), which computes
 // comm->pxnDisable itself and never calls this getter. 0 -- "PXN not
-// disabled" -- is the common-case default.
-int ncclPxnDisable(struct ncclComm* /*comm*/) { return 0; }
+// disabled" -- is the common-case default, now a controllable seam so
+// rcclUseReduceScatterDirect's PXN-disabled branch (never exercised before)
+// can be proven too.
+static int DefaultPxnDisable(struct ncclComm* /*comm*/) { return 0; }
+std::function<int(struct ncclComm*)> g_pxnDisable = DefaultPxnDisable;
+int ncclPxnDisable(struct ncclComm* comm) { return g_pxnDisable(comm); }
 
 // ncclDevFuncUnrollGenerated: extern bool const[NCCL_NUM_UNROLLS]. Real array,
 // not abort-floor -- commSetUnrollFactor indexes it unconditionally on every
 // call, including the manual-override path any Tier-1-adjacent test might
 // exercise. All-true is the safe default: "every unroll factor was built".
+//
+// Confirmed NOT safely upgradeable to a test seam: device.h's `extern bool
+// const [...]` declaration is transitively visible in this TU too (this
+// file doesn't include device.h directly, but something in its include
+// chain does) -- dropping `const` here is a hard redefinition-with-
+// different-type compile error, not just a lurking runtime risk. Leaving
+// this const and documented, not forced through.
 //
 // The static_assert below is the same signature-drift-watchdog idea as
 // fakes/signature-drift.h: without it, a new unroll factor added to RCCL
@@ -141,12 +163,16 @@ static_assert(NCCL_NUM_UNROLLS == 6,
               "NCCL_NUM_UNROLLS changed -- add/remove a `true` entry below to match");
 const bool ncclDevFuncUnrollGenerated[NCCL_NUM_UNROLLS] = {true, true, true, true, true, true};
 
-// ncclCommCount: trivial accessor, real behaviour costs nothing and de-risks
-// future test batches (rcclGetAlgoInfo reads it via NCCLCHECK(ncclCommCount(...))).
-ncclResult_t ncclCommCount(const ncclComm_t comm, int* count) {
+// ncclCommCount: real behaviour by default (de-risks future test batches),
+// but a controllable seam so rcclGetAlgoInfo's NCCLCHECK(ncclCommCount(...))
+// failure arm (never exercised -- every prior test let this succeed) can be
+// proven too.
+static ncclResult_t DefaultCommCount(const ncclComm_t comm, int* count) {
   if (count) *count = comm ? comm->nRanks : 0;
   return ncclSuccess;
 }
+std::function<ncclResult_t(const ncclComm_t, int*)> g_commCount = DefaultCommCount;
+ncclResult_t ncclCommCount(const ncclComm_t comm, int* count) { return g_commCount(comm, count); }
 
 // ---------------------------------------------------------------------------
 // ncclAlgoToString / ncclProtoToString / ncclFuncToString / ncclDatatypeToString:
@@ -240,44 +266,183 @@ const char* ncclProtoToString(int proto) {  // collectives.cc:136
 }
 
 // ---------------------------------------------------------------------------
-// Abort floor: reachable only from rcclSelectAllReduce / rcclSelectAllGather /
-// rcclSelectReduceScatter / rcclHierarchicalAlgoInfo / rcclGetAlgoInfo /
-// rcclSymKGetInfo -- none exercised by the current test batch. Kept as
-// abort() so a test that accidentally reaches one of these fails immediately
-// at the exact call site instead of silently taking a wrong default; upgrade
-// to a controllable seam the moment a future test needs to drive one of
-// these -- see MICROTEST_README.md, "Adding more controllable seams."
+// Controllable seams for the "High-tier" group (rcclSelectAllReduce/
+// AllGather/ReduceScatter, rcclHierarchicalAlgoInfo, rcclGetAlgoInfo,
+// rcclGetCollImplInfo, rcclSymkQuery/rcclSymKGetInfo's deep path). Previously
+// all abort()-floors (see MICROTEST_README.md, "Adding more controllable
+// seams" for the pattern followed here); upgraded so wrap-test.cc can drive
+// each branch of those dispatchers directly. Every default below reproduces
+// the safe, common "this fast path doesn't apply" case so existing tests
+// upstream of these seams are unaffected -- verified by rereading each real
+// call site before choosing it.
 // ---------------------------------------------------------------------------
 
-bool isSymmetricKernelRequested(struct ncclComm*, ncclFunc_t, int, ncclDataType_t, size_t, const void*, void*) {
-  ::abort();
+// Drives `symEligible` in all three rcclSelectXxx functions. Default false:
+// "no symmetric-window kernel requested," letting the DDA/CE/Direct/plain
+// paths run, matching every existing (guard-only) test's expectations.
+static bool DefaultIsSymmetricKernelRequested(struct ncclComm*, ncclFunc_t, int, ncclDataType_t, size_t, const void*,
+                                              void*) {
+  return false;
+}
+std::function<bool(struct ncclComm*, ncclFunc_t, int, ncclDataType_t, size_t, const void*, void*)>
+    g_isSymmetricKernelRequested = DefaultIsSymmetricKernelRequested;
+bool isSymmetricKernelRequested(struct ncclComm* comm, ncclFunc_t coll, int symkOp, ncclDataType_t datatype,
+                                size_t nElts, const void* sendbuff, void* recvbuff) {
+  return g_isSymmetricKernelRequested(comm, coll, symkOp, datatype, nElts, sendbuff, recvbuff);
 }
 
-ncclResult_t ncclCudaGetCapturingGraph(struct ncclCudaGraph*, hipStream_t, int) { ::abort(); }
-
-ncclResult_t ncclDevrFindWindow(struct ncclComm*, void const*, struct ncclDevrWindow**) { ::abort(); }
-bool ncclDevrWindowHasSysmemSegment(struct ncclDevrWindow*) { ::abort(); }
-ncclResult_t ncclGetSymRegType(struct ncclDevrWindow*, struct ncclDevrWindow*, ncclSymRegType_t*) { ::abort(); }
-
-ncclResult_t ncclSymkInitOnce(struct ncclComm*) { ::abort(); }
-bool ncclSymkAvailable(struct ncclComm*, ncclFunc_t, int, ncclDataType_t, size_t) { ::abort(); }
-ncclResult_t ncclSymkPickKernel(struct ncclComm*, ncclFunc_t, int, ncclDataType_t, size_t, size_t, int,
-                                ncclSymRegType_t, float*, ncclSymkKernelId*, int*, int*, bool*) {
-  ::abort();
+// Drives `ceCapturing` on rcclSelectAllReduce's live (query=false) path only
+// (query=true uses the caller-supplied graphCapturingHint instead). Default:
+// "not currently capturing a graph" (ncclCudaGraphNone's real, inline
+// semantics -- graphId == ULLONG_MAX), the common non-graph-mode case.
+static ncclResult_t DefaultCudaGetCapturingGraph(struct ncclCudaGraph* graph, hipStream_t, int graphUsageMode) {
+  *graph = ncclCudaGraphNone(graphUsageMode);
+  return ncclSuccess;
 }
-bool rcclSymkKernelIdIsLL(int) { ::abort(); }
+std::function<ncclResult_t(struct ncclCudaGraph*, hipStream_t, int)> g_cudaGetCapturingGraph =
+    DefaultCudaGetCapturingGraph;
+ncclResult_t ncclCudaGetCapturingGraph(struct ncclCudaGraph* graph, hipStream_t stream, int graphUsageMode) {
+  return g_cudaGetCapturingGraph(graph, stream, graphUsageMode);
+}
 
-bool ncclCeAvailable(struct ncclComm*, ncclFunc_t, int, ncclDataType_t, ncclSymRegType_t) { ::abort(); }
-bool ncclCeScratchAvailable(struct ncclComm*, ncclFunc_t, int, ncclDataType_t, ncclSymRegType_t) { ::abort(); }
-int ncclCeLocalReduceBlocks(ncclDataType_t, size_t) { ::abort(); }
+// Window/registration-state trio, driving hasSysmemSegment/winRegType in
+// AllReduce's and AllGather's CE checks. Defaults: no window found (a plain,
+// unregistered buffer -- the common case for operands not set up as
+// symmetric windows), no sysmem segment, and the "neither side registered"
+// reg-type.
+static ncclResult_t DefaultDevrFindWindow(struct ncclComm*, void const*, struct ncclDevrWindow** window) {
+  *window = nullptr;
+  return ncclSuccess;
+}
+std::function<ncclResult_t(struct ncclComm*, void const*, struct ncclDevrWindow**)> g_devrFindWindow =
+    DefaultDevrFindWindow;
+ncclResult_t ncclDevrFindWindow(struct ncclComm* comm, void const* ptr, struct ncclDevrWindow** window) {
+  return g_devrFindWindow(comm, ptr, window);
+}
 
-bool rcclAllReduceShouldTakeDdaPath(struct ncclComm*, size_t, ncclDataType_t, bool, bool) { ::abort(); }
+static bool DefaultDevrWindowHasSysmemSegment(struct ncclDevrWindow*) { return false; }
+std::function<bool(struct ncclDevrWindow*)> g_devrWindowHasSysmemSegment = DefaultDevrWindowHasSysmemSegment;
+bool ncclDevrWindowHasSysmemSegment(struct ncclDevrWindow* window) { return g_devrWindowHasSysmemSegment(window); }
+
+static ncclResult_t DefaultGetSymRegType(struct ncclDevrWindow*, struct ncclDevrWindow*, ncclSymRegType_t* type) {
+  *type = ncclSymSendNonregRecvNonreg;
+  return ncclSuccess;
+}
+std::function<ncclResult_t(struct ncclDevrWindow*, struct ncclDevrWindow*, ncclSymRegType_t*)> g_getSymRegType =
+    DefaultGetSymRegType;
+ncclResult_t ncclGetSymRegType(struct ncclDevrWindow* sendWin, struct ncclDevrWindow* recvWin,
+                               ncclSymRegType_t* type) {
+  return g_getSymRegType(sendWin, recvWin, type);
+}
+
+// Symmetric-kernel deep path (past rcclSymkQuery's four already-tested early
+// guards). Defaults: init succeeds (common case), but "not available" so
+// rcclSymkQuery still returns false by default -- a test opts a specific
+// case into the real kernel-pick path via ScopedHook.
+static ncclResult_t DefaultSymkInitOnce(struct ncclComm*) { return ncclSuccess; }
+std::function<ncclResult_t(struct ncclComm*)> g_symkInitOnce = DefaultSymkInitOnce;
+ncclResult_t ncclSymkInitOnce(struct ncclComm* comm) { return g_symkInitOnce(comm); }
+
+static bool DefaultSymkAvailable(struct ncclComm*, ncclFunc_t, int, ncclDataType_t, size_t) { return false; }
+std::function<bool(struct ncclComm*, ncclFunc_t, int, ncclDataType_t, size_t)> g_symkAvailable = DefaultSymkAvailable;
+bool ncclSymkAvailable(struct ncclComm* comm, ncclFunc_t coll, int op, ncclDataType_t dt, size_t count) {
+  return g_symkAvailable(comm, coll, op, dt, count);
+}
+
+// Default: succeeds but reports "no kernel found" (ncclSymkKernelId_Count),
+// matching the sentinel rcclSymkQuery itself checks for and rejects -- a
+// graceful "queried, nothing matched" default rather than a real pick.
+static ncclResult_t DefaultSymkPickKernel(struct ncclComm*, ncclFunc_t, int, ncclDataType_t, size_t, size_t, int,
+                                          ncclSymRegType_t, float* estTimeUs, ncclSymkKernelId* kernelId,
+                                          int* maxChannels, int* nWarps, bool* forced) {
+  *estTimeUs = 0.0f;
+  *kernelId = ncclSymkKernelId_Count;
+  *maxChannels = 0;
+  *nWarps = 0;
+  *forced = false;
+  return ncclSuccess;
+}
+std::function<ncclResult_t(struct ncclComm*, ncclFunc_t, int, ncclDataType_t, size_t, size_t, int, ncclSymRegType_t,
+                            float*, ncclSymkKernelId*, int*, int*, bool*)>
+    g_symkPickKernel = DefaultSymkPickKernel;
+ncclResult_t ncclSymkPickKernel(struct ncclComm* comm, ncclFunc_t coll, int op, ncclDataType_t dt, size_t count,
+                                size_t count2, int n, ncclSymRegType_t regType, float* estTimeUs,
+                                ncclSymkKernelId* kernelId, int* maxChannels, int* nWarps, bool* forced) {
+  return g_symkPickKernel(comm, coll, op, dt, count, count2, n, regType, estTimeUs, kernelId, maxChannels, nWarps,
+                          forced);
+}
+
+static bool DefaultSymkKernelIdIsLL(int) { return false; }
+std::function<bool(int)> g_symkKernelIdIsLL = DefaultSymkKernelIdIsLL;
+bool rcclSymkKernelIdIsLL(int kernelId) { return g_symkKernelIdIsLL(kernelId); }
+
+// CE availability trio. Defaults false/false/1: CE fast paths off by
+// default (a test opts in via ScopedHook), a small positive block count so
+// a test that DOES opt CE in without also overriding this gets a sane,
+// nonzero channel count rather than a silently-wrong 0.
+static bool DefaultCeAvailable(struct ncclComm*, ncclFunc_t, int, ncclDataType_t, ncclSymRegType_t) { return false; }
+std::function<bool(struct ncclComm*, ncclFunc_t, int, ncclDataType_t, ncclSymRegType_t)> g_ceAvailable =
+    DefaultCeAvailable;
+bool ncclCeAvailable(struct ncclComm* comm, ncclFunc_t coll, int op, ncclDataType_t dt, ncclSymRegType_t regType) {
+  return g_ceAvailable(comm, coll, op, dt, regType);
+}
+
+static bool DefaultCeScratchAvailable(struct ncclComm*, ncclFunc_t, int, ncclDataType_t, ncclSymRegType_t) {
+  return false;
+}
+std::function<bool(struct ncclComm*, ncclFunc_t, int, ncclDataType_t, ncclSymRegType_t)> g_ceScratchAvailable =
+    DefaultCeScratchAvailable;
+bool ncclCeScratchAvailable(struct ncclComm* comm, ncclFunc_t coll, int op, ncclDataType_t dt,
+                            ncclSymRegType_t regType) {
+  return g_ceScratchAvailable(comm, coll, op, dt, regType);
+}
+
+static int DefaultCeLocalReduceBlocks(ncclDataType_t, size_t) { return 1; }
+std::function<int(ncclDataType_t, size_t)> g_ceLocalReduceBlocks = DefaultCeLocalReduceBlocks;
+int ncclCeLocalReduceBlocks(ncclDataType_t dt, size_t count) { return g_ceLocalReduceBlocks(dt, count); }
+
+// rcclAllReduceShouldTakeDdaPath: real body lives in collectives.cc (not
+// linked here), same abort-floor-turned-seam treatment as the rest. Default
+// false: DDA not taken, letting CE-registered/symmetric/plain-kernel run.
+static bool DefaultAllReduceShouldTakeDdaPath(const struct ncclComm*, size_t, ncclDataType_t, bool, bool) {
+  return false;
+}
+std::function<bool(const struct ncclComm*, size_t, ncclDataType_t, bool, bool)> g_allReduceShouldTakeDdaPath =
+    DefaultAllReduceShouldTakeDdaPath;
+bool rcclAllReduceShouldTakeDdaPath(const struct ncclComm* comm, size_t count, ncclDataType_t dt, bool symEligible,
+                                    bool ceAllReduceAllowed) {
+  return g_allReduceShouldTakeDdaPath(comm, count, dt, symEligible, ceAllReduceAllowed);
+}
 
 // getAlgoInfo / rcclKernelPackedChannels: rccl_wrap.cc `extern`-declares both
 // itself (their real definitions live in enqueue.cc / device-side tuning,
 // outside this TU's link closure), so no separate declaration is needed here.
-ncclResult_t getAlgoInfo(struct ncclComm*, struct ncclTaskColl*, int, int, int, ncclSimInfo_t*) { ::abort(); }
-int rcclKernelPackedChannels(struct ncclComm*, ncclFunc_t, size_t, ncclDataType_t, int, int) { ::abort(); }
+// Default getAlgoInfo fills in a sane, generic Ring/Simple/1-channel answer
+// (the universal plain-kernel fallback every rcclSelectXxx eventually falls
+// to); default rcclKernelPackedChannels passes the tuning-cap channel count
+// through unpacked, a safe no-op default.
+static ncclResult_t DefaultGetAlgoInfo(struct ncclComm*, struct ncclTaskColl* task, int, int, int, ncclSimInfo_t*) {
+  task->algorithm = NCCL_ALGO_RING;
+  task->protocol = NCCL_PROTO_SIMPLE;
+  task->nMaxChannels = 1;
+  return ncclSuccess;
+}
+std::function<ncclResult_t(struct ncclComm*, struct ncclTaskColl*, int, int, int, ncclSimInfo_t*)> g_getAlgoInfo =
+    DefaultGetAlgoInfo;
+ncclResult_t getAlgoInfo(struct ncclComm* comm, struct ncclTaskColl* task, int collNetSupport, int nvlsSupport,
+                         int numPipeOps, ncclSimInfo_t* simInfo) {
+  return g_getAlgoInfo(comm, task, collNetSupport, nvlsSupport, numPipeOps, simInfo);
+}
+
+static int DefaultKernelPackedChannels(struct ncclComm*, ncclFunc_t, size_t, ncclDataType_t, int, int nMaxChannels) {
+  return nMaxChannels;
+}
+std::function<int(struct ncclComm*, ncclFunc_t, size_t, ncclDataType_t, int, int)> g_kernelPackedChannels =
+    DefaultKernelPackedChannels;
+int rcclKernelPackedChannels(struct ncclComm* comm, ncclFunc_t func, size_t count, ncclDataType_t dt, int protocol,
+                             int nMaxChannels) {
+  return g_kernelPackedChannels(comm, func, count, dt, protocol, nMaxChannels);
+}
 
 // rcclLL128ElemsPerThreadFromArch is `inline` in archinfo.h (transitively
 // included), so no stub is needed here.
@@ -294,38 +459,212 @@ ncclResult_t amd_smi_getFirmwareVersion(uint32_t devIdx, uint64_t* fwVersion) {
   return g_amdSmiGetFirmwareVersion(devIdx, fwVersion);
 }
 
+// --- Per-collective DDA eligibility/blocks (24 functions total) ---
+// Every *Eligible defaults false (DDA path not eligible by default, letting
+// CE-registered/symmetric/hierarchical/Direct/plain-kernel run, matching
+// every existing test's expectations); every *Blocks defaults to 1 (a sane
+// nonzero placeholder for a test that opts a path in without separately
+// overriding the channel count). One seam pair per function, same
+// Default*/g_hookName pattern as every other seam in this file.
+
 // --- AllReduce DDA (dda_all_reduce.h) ---
-bool ncclAllReduceDdaIpcEligible(ncclComm*, const void*, void*, size_t, ncclDataType_t, ncclRedOp_t) { ::abort(); }
-bool ncclAllReduceDdaFabricEligible(ncclComm*, const void*, void*, size_t, ncclDataType_t, ncclRedOp_t) { ::abort(); }
-bool ncclAllReduceDdaFabricLLEligible(ncclComm*, const void*, void*, size_t, ncclDataType_t, ncclRedOp_t) { ::abort(); }
-bool ncclAllReduceDdaFabricLL128Eligible(ncclComm*, const void*, void*, size_t, ncclDataType_t, ncclRedOp_t) {
-  ::abort();
+static bool DefaultAllReduceDdaIpcEligible(ncclComm*, const void*, void*, size_t, ncclDataType_t, ncclRedOp_t) {
+  return false;
 }
-uint32_t ncclAllReduceDdaIpcBlocks(ncclComm*, size_t, ncclDataType_t) { ::abort(); }
-uint32_t ncclAllReduceDdaFabricBlocks(ncclComm*, size_t, ncclDataType_t) { ::abort(); }
-uint32_t ncclAllReduceDdaFabricLLBlocks(ncclComm*, size_t, ncclDataType_t) { ::abort(); }
-uint32_t ncclAllReduceDdaFabricLL128Blocks(ncclComm*, size_t, ncclDataType_t) { ::abort(); }
+std::function<bool(ncclComm*, const void*, void*, size_t, ncclDataType_t, ncclRedOp_t)>
+    g_allReduceDdaIpcEligible = DefaultAllReduceDdaIpcEligible;
+bool ncclAllReduceDdaIpcEligible(ncclComm* comm, const void* sb, void* rb, size_t count, ncclDataType_t dt,
+                                 ncclRedOp_t op) {
+  return g_allReduceDdaIpcEligible(comm, sb, rb, count, dt, op);
+}
+
+static bool DefaultAllReduceDdaFabricEligible(ncclComm*, const void*, void*, size_t, ncclDataType_t, ncclRedOp_t) {
+  return false;
+}
+std::function<bool(ncclComm*, const void*, void*, size_t, ncclDataType_t, ncclRedOp_t)>
+    g_allReduceDdaFabricEligible = DefaultAllReduceDdaFabricEligible;
+bool ncclAllReduceDdaFabricEligible(ncclComm* comm, const void* sb, void* rb, size_t count, ncclDataType_t dt,
+                                    ncclRedOp_t op) {
+  return g_allReduceDdaFabricEligible(comm, sb, rb, count, dt, op);
+}
+
+static bool DefaultAllReduceDdaFabricLLEligible(ncclComm*, const void*, void*, size_t, ncclDataType_t, ncclRedOp_t) {
+  return false;
+}
+std::function<bool(ncclComm*, const void*, void*, size_t, ncclDataType_t, ncclRedOp_t)>
+    g_allReduceDdaFabricLLEligible = DefaultAllReduceDdaFabricLLEligible;
+bool ncclAllReduceDdaFabricLLEligible(ncclComm* comm, const void* sb, void* rb, size_t count, ncclDataType_t dt,
+                                      ncclRedOp_t op) {
+  return g_allReduceDdaFabricLLEligible(comm, sb, rb, count, dt, op);
+}
+
+static bool DefaultAllReduceDdaFabricLL128Eligible(ncclComm*, const void*, void*, size_t, ncclDataType_t,
+                                                   ncclRedOp_t) {
+  return false;
+}
+std::function<bool(ncclComm*, const void*, void*, size_t, ncclDataType_t, ncclRedOp_t)>
+    g_allReduceDdaFabricLL128Eligible = DefaultAllReduceDdaFabricLL128Eligible;
+bool ncclAllReduceDdaFabricLL128Eligible(ncclComm* comm, const void* sb, void* rb, size_t count, ncclDataType_t dt,
+                                         ncclRedOp_t op) {
+  return g_allReduceDdaFabricLL128Eligible(comm, sb, rb, count, dt, op);
+}
+
+static uint32_t DefaultAllReduceDdaIpcBlocks(ncclComm*, size_t, ncclDataType_t) { return 1; }
+std::function<uint32_t(ncclComm*, size_t, ncclDataType_t)> g_allReduceDdaIpcBlocks = DefaultAllReduceDdaIpcBlocks;
+uint32_t ncclAllReduceDdaIpcBlocks(ncclComm* comm, size_t count, ncclDataType_t dt) {
+  return g_allReduceDdaIpcBlocks(comm, count, dt);
+}
+
+static uint32_t DefaultAllReduceDdaFabricBlocks(ncclComm*, size_t, ncclDataType_t) { return 1; }
+std::function<uint32_t(ncclComm*, size_t, ncclDataType_t)> g_allReduceDdaFabricBlocks =
+    DefaultAllReduceDdaFabricBlocks;
+uint32_t ncclAllReduceDdaFabricBlocks(ncclComm* comm, size_t count, ncclDataType_t dt) {
+  return g_allReduceDdaFabricBlocks(comm, count, dt);
+}
+
+static uint32_t DefaultAllReduceDdaFabricLLBlocks(ncclComm*, size_t, ncclDataType_t) { return 1; }
+std::function<uint32_t(ncclComm*, size_t, ncclDataType_t)> g_allReduceDdaFabricLLBlocks =
+    DefaultAllReduceDdaFabricLLBlocks;
+uint32_t ncclAllReduceDdaFabricLLBlocks(ncclComm* comm, size_t count, ncclDataType_t dt) {
+  return g_allReduceDdaFabricLLBlocks(comm, count, dt);
+}
+
+static uint32_t DefaultAllReduceDdaFabricLL128Blocks(ncclComm*, size_t, ncclDataType_t) { return 1; }
+std::function<uint32_t(ncclComm*, size_t, ncclDataType_t)> g_allReduceDdaFabricLL128Blocks =
+    DefaultAllReduceDdaFabricLL128Blocks;
+uint32_t ncclAllReduceDdaFabricLL128Blocks(ncclComm* comm, size_t count, ncclDataType_t dt) {
+  return g_allReduceDdaFabricLL128Blocks(comm, count, dt);
+}
 
 // --- AllGather DDA (dda_all_gather.h) ---
-bool ncclAllGatherDdaIpcEligible(ncclComm*, const void*, void*, size_t, ncclDataType_t) { ::abort(); }
-bool ncclAllGatherDdaFabricEligible(ncclComm*, const void*, void*, size_t, ncclDataType_t) { ::abort(); }
-bool ncclAllGatherDdaFabricLLEligible(ncclComm*, const void*, void*, size_t, ncclDataType_t) { ::abort(); }
-bool ncclAllGatherDdaFabricLL128Eligible(ncclComm*, const void*, void*, size_t, ncclDataType_t) { ::abort(); }
-uint32_t ncclAllGatherDdaIpcBlocks(ncclComm*, size_t, ncclDataType_t) { ::abort(); }
-uint32_t ncclAllGatherDdaFabricBlocks(ncclComm*, size_t, ncclDataType_t) { ::abort(); }
-uint32_t ncclAllGatherDdaFabricLLBlocks(ncclComm*, size_t, ncclDataType_t) { ::abort(); }
-uint32_t ncclAllGatherDdaFabricLL128Blocks(ncclComm*, size_t, ncclDataType_t) { ::abort(); }
+static bool DefaultAllGatherDdaIpcEligible(ncclComm*, const void*, void*, size_t, ncclDataType_t) { return false; }
+std::function<bool(ncclComm*, const void*, void*, size_t, ncclDataType_t)> g_allGatherDdaIpcEligible =
+    DefaultAllGatherDdaIpcEligible;
+bool ncclAllGatherDdaIpcEligible(ncclComm* comm, const void* sb, void* rb, size_t count, ncclDataType_t dt) {
+  return g_allGatherDdaIpcEligible(comm, sb, rb, count, dt);
+}
+
+static bool DefaultAllGatherDdaFabricEligible(ncclComm*, const void*, void*, size_t, ncclDataType_t) { return false; }
+std::function<bool(ncclComm*, const void*, void*, size_t, ncclDataType_t)> g_allGatherDdaFabricEligible =
+    DefaultAllGatherDdaFabricEligible;
+bool ncclAllGatherDdaFabricEligible(ncclComm* comm, const void* sb, void* rb, size_t count, ncclDataType_t dt) {
+  return g_allGatherDdaFabricEligible(comm, sb, rb, count, dt);
+}
+
+static bool DefaultAllGatherDdaFabricLLEligible(ncclComm*, const void*, void*, size_t, ncclDataType_t) {
+  return false;
+}
+std::function<bool(ncclComm*, const void*, void*, size_t, ncclDataType_t)> g_allGatherDdaFabricLLEligible =
+    DefaultAllGatherDdaFabricLLEligible;
+bool ncclAllGatherDdaFabricLLEligible(ncclComm* comm, const void* sb, void* rb, size_t count, ncclDataType_t dt) {
+  return g_allGatherDdaFabricLLEligible(comm, sb, rb, count, dt);
+}
+
+static bool DefaultAllGatherDdaFabricLL128Eligible(ncclComm*, const void*, void*, size_t, ncclDataType_t) {
+  return false;
+}
+std::function<bool(ncclComm*, const void*, void*, size_t, ncclDataType_t)> g_allGatherDdaFabricLL128Eligible =
+    DefaultAllGatherDdaFabricLL128Eligible;
+bool ncclAllGatherDdaFabricLL128Eligible(ncclComm* comm, const void* sb, void* rb, size_t count,
+                                         ncclDataType_t dt) {
+  return g_allGatherDdaFabricLL128Eligible(comm, sb, rb, count, dt);
+}
+
+static uint32_t DefaultAllGatherDdaIpcBlocks(ncclComm*, size_t, ncclDataType_t) { return 1; }
+std::function<uint32_t(ncclComm*, size_t, ncclDataType_t)> g_allGatherDdaIpcBlocks = DefaultAllGatherDdaIpcBlocks;
+uint32_t ncclAllGatherDdaIpcBlocks(ncclComm* comm, size_t count, ncclDataType_t dt) {
+  return g_allGatherDdaIpcBlocks(comm, count, dt);
+}
+
+static uint32_t DefaultAllGatherDdaFabricBlocks(ncclComm*, size_t, ncclDataType_t) { return 1; }
+std::function<uint32_t(ncclComm*, size_t, ncclDataType_t)> g_allGatherDdaFabricBlocks =
+    DefaultAllGatherDdaFabricBlocks;
+uint32_t ncclAllGatherDdaFabricBlocks(ncclComm* comm, size_t count, ncclDataType_t dt) {
+  return g_allGatherDdaFabricBlocks(comm, count, dt);
+}
+
+static uint32_t DefaultAllGatherDdaFabricLLBlocks(ncclComm*, size_t, ncclDataType_t) { return 1; }
+std::function<uint32_t(ncclComm*, size_t, ncclDataType_t)> g_allGatherDdaFabricLLBlocks =
+    DefaultAllGatherDdaFabricLLBlocks;
+uint32_t ncclAllGatherDdaFabricLLBlocks(ncclComm* comm, size_t count, ncclDataType_t dt) {
+  return g_allGatherDdaFabricLLBlocks(comm, count, dt);
+}
+
+static uint32_t DefaultAllGatherDdaFabricLL128Blocks(ncclComm*, size_t, ncclDataType_t) { return 1; }
+std::function<uint32_t(ncclComm*, size_t, ncclDataType_t)> g_allGatherDdaFabricLL128Blocks =
+    DefaultAllGatherDdaFabricLL128Blocks;
+uint32_t ncclAllGatherDdaFabricLL128Blocks(ncclComm* comm, size_t count, ncclDataType_t dt) {
+  return g_allGatherDdaFabricLL128Blocks(comm, count, dt);
+}
 
 // --- ReduceScatter DDA (dda_reduce_scatter.h) ---
-bool ncclReduceScatterDdaIpcEligible(ncclComm*, const void*, void*, size_t, ncclDataType_t, ncclRedOp_t) {
-  ::abort();
+static bool DefaultReduceScatterDdaIpcEligible(ncclComm*, const void*, void*, size_t, ncclDataType_t, ncclRedOp_t) {
+  return false;
 }
-bool ncclReduceScatterDdaFabricEligible(ncclComm*, const void*, void*, size_t, ncclDataType_t, ncclRedOp_t) {
-  ::abort();
+std::function<bool(ncclComm*, const void*, void*, size_t, ncclDataType_t, ncclRedOp_t)>
+    g_reduceScatterDdaIpcEligible = DefaultReduceScatterDdaIpcEligible;
+bool ncclReduceScatterDdaIpcEligible(ncclComm* comm, const void* sb, void* rb, size_t count, ncclDataType_t dt,
+                                     ncclRedOp_t op) {
+  return g_reduceScatterDdaIpcEligible(comm, sb, rb, count, dt, op);
 }
-bool ncclReduceScatterDdaFabricLLEligible(ncclComm*, const void*, void*, size_t, ncclDataType_t, ncclRedOp_t) {
-  ::abort();
+
+static bool DefaultReduceScatterDdaFabricEligible(ncclComm*, const void*, void*, size_t, ncclDataType_t,
+                                                  ncclRedOp_t) {
+  return false;
 }
-bool ncclReduceScatterDdaFabricLL128Eligible(ncclComm*, const void*, void*, size_t, ncclDataType_t, ncclRedOp_t) {
-  ::abort();
+std::function<bool(ncclComm*, const void*, void*, size_t, ncclDataType_t, ncclRedOp_t)>
+    g_reduceScatterDdaFabricEligible = DefaultReduceScatterDdaFabricEligible;
+bool ncclReduceScatterDdaFabricEligible(ncclComm* comm, const void* sb, void* rb, size_t count, ncclDataType_t dt,
+                                        ncclRedOp_t op) {
+  return g_reduceScatterDdaFabricEligible(comm, sb, rb, count, dt, op);
+}
+
+static bool DefaultReduceScatterDdaFabricLLEligible(ncclComm*, const void*, void*, size_t, ncclDataType_t,
+                                                    ncclRedOp_t) {
+  return false;
+}
+std::function<bool(ncclComm*, const void*, void*, size_t, ncclDataType_t, ncclRedOp_t)>
+    g_reduceScatterDdaFabricLLEligible = DefaultReduceScatterDdaFabricLLEligible;
+bool ncclReduceScatterDdaFabricLLEligible(ncclComm* comm, const void* sb, void* rb, size_t count,
+                                          ncclDataType_t dt, ncclRedOp_t op) {
+  return g_reduceScatterDdaFabricLLEligible(comm, sb, rb, count, dt, op);
+}
+
+static bool DefaultReduceScatterDdaFabricLL128Eligible(ncclComm*, const void*, void*, size_t, ncclDataType_t,
+                                                       ncclRedOp_t) {
+  return false;
+}
+std::function<bool(ncclComm*, const void*, void*, size_t, ncclDataType_t, ncclRedOp_t)>
+    g_reduceScatterDdaFabricLL128Eligible = DefaultReduceScatterDdaFabricLL128Eligible;
+bool ncclReduceScatterDdaFabricLL128Eligible(ncclComm* comm, const void* sb, void* rb, size_t count,
+                                             ncclDataType_t dt, ncclRedOp_t op) {
+  return g_reduceScatterDdaFabricLL128Eligible(comm, sb, rb, count, dt, op);
+}
+
+static uint32_t DefaultReduceScatterDdaIpcBlocks(ncclComm*, size_t, ncclDataType_t) { return 1; }
+std::function<uint32_t(ncclComm*, size_t, ncclDataType_t)> g_reduceScatterDdaIpcBlocks =
+    DefaultReduceScatterDdaIpcBlocks;
+uint32_t ncclReduceScatterDdaIpcBlocks(ncclComm* comm, size_t count, ncclDataType_t dt) {
+  return g_reduceScatterDdaIpcBlocks(comm, count, dt);
+}
+
+static uint32_t DefaultReduceScatterDdaFabricBlocks(ncclComm*, size_t, ncclDataType_t) { return 1; }
+std::function<uint32_t(ncclComm*, size_t, ncclDataType_t)> g_reduceScatterDdaFabricBlocks =
+    DefaultReduceScatterDdaFabricBlocks;
+uint32_t ncclReduceScatterDdaFabricBlocks(ncclComm* comm, size_t count, ncclDataType_t dt) {
+  return g_reduceScatterDdaFabricBlocks(comm, count, dt);
+}
+
+static uint32_t DefaultReduceScatterDdaFabricLLBlocks(ncclComm*, size_t, ncclDataType_t) { return 1; }
+std::function<uint32_t(ncclComm*, size_t, ncclDataType_t)> g_reduceScatterDdaFabricLLBlocks =
+    DefaultReduceScatterDdaFabricLLBlocks;
+uint32_t ncclReduceScatterDdaFabricLLBlocks(ncclComm* comm, size_t count, ncclDataType_t dt) {
+  return g_reduceScatterDdaFabricLLBlocks(comm, count, dt);
+}
+
+static uint32_t DefaultReduceScatterDdaFabricLL128Blocks(ncclComm*, size_t, ncclDataType_t) { return 1; }
+std::function<uint32_t(ncclComm*, size_t, ncclDataType_t)> g_reduceScatterDdaFabricLL128Blocks =
+    DefaultReduceScatterDdaFabricLL128Blocks;
+uint32_t ncclReduceScatterDdaFabricLL128Blocks(ncclComm* comm, size_t count, ncclDataType_t dt) {
+  return g_reduceScatterDdaFabricLL128Blocks(comm, count, dt);
 }
