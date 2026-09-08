@@ -351,21 +351,49 @@ std::string LocateKernelFile(std::string filename, hsa_agent_t agent) {
     return obj_file;
   }
 
-  // Try ./<agent_name>/<filename>
-  obj_file = "./" + std::string(agent_name) + "/" + filename;
-  file_handle = open(obj_file.c_str(), O_RDONLY);
-  if (file_handle >= 0) {
-    close(file_handle);
+  std::string exe_dir = GetExecutableDir();
+
+  // Look for the kernel under a directory named after the device. Returns the
+  // matching path, or an empty string if not found.
+  auto try_device_dir = [&](const std::string& dev_name) -> std::string {
+    // Try ./<dev_name>/<filename>
+    std::string path = "./" + dev_name + "/" + filename;
+    int fh = open(path.c_str(), O_RDONLY);
+    if (fh >= 0) {
+      close(fh);
+      return path;
+    }
+    // Try <exe_dir>/../share/rocrtst/<dev_name>/<filename>
+    path = exe_dir + "/../share/rocrtst/" + dev_name + "/" + filename;
+    fh = open(path.c_str(), O_RDONLY);
+    if (fh >= 0) {
+      close(fh);
+      return path;
+    }
+    return std::string();
+  };
+
+  // Try the ISA name the runtime reports for this agent.
+  obj_file = try_device_dir(agent_name);
+  if (!obj_file.empty()) {
     return obj_file;
   }
 
-  // Try <exe_dir>/../share/rocrtst/<agent_name>/<filename>
-  std::string exe_dir = GetExecutableDir();
-  obj_file = exe_dir + "/../share/rocrtst/" + std::string(agent_name) + "/" + filename;
-  file_handle = open(obj_file.c_str(), O_RDONLY);
-  if (file_handle >= 0) {
-    close(file_handle);
-    return obj_file;
+  // On A0 silicon the runtime reports the "-strict" ISA variant (e.g.
+  // gfx1250-strict), but kernels are compiled and installed under the base
+  // device name (gfx1250). Both are the same ISA version, so the base-named
+  // objects load and run. Fall back to the base name with "-strict" removed.
+  // This only affects "-strict" names; every other device name is unchanged.
+  std::string base_name = agent_name;
+  const std::string kStrictSuffix = "-strict";
+  if (base_name.size() > kStrictSuffix.size() &&
+      base_name.compare(base_name.size() - kStrictSuffix.size(), kStrictSuffix.size(),
+                        kStrictSuffix) == 0) {
+    base_name.erase(base_name.size() - kStrictSuffix.size());
+    obj_file = try_device_dir(base_name);
+    if (!obj_file.empty()) {
+      return obj_file;
+    }
   }
 
   throw std::runtime_error("Could not open kernel file: " + filename);
